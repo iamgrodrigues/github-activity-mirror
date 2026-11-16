@@ -1,8 +1,9 @@
+import datetime
 import json
 from pathlib import Path
 import re
 
-from .models import Config, Destination, GitIdentity, MirrorError, SourceRepository, require_keys
+from .models import Config, Destination, GitIdentity, HistoryWindow, MirrorError, SourceRepository, require_keys, valid_date
 
 
 def load_config(path: Path) -> Config:
@@ -15,7 +16,10 @@ def load_config(path: Path) -> Config:
 
 
 def parse_config(raw: object, base: Path) -> Config:
-	config = require_keys(raw, {"destination", "companies"}, "configuration")
+	keys = {"destination", "companies"}
+	if isinstance(raw, dict) and "history" in raw:
+		keys.add("history")
+	config = require_keys(raw, keys, "configuration")
 	destination = parse_destination(config["destination"], base)
 	companies = config["companies"]
 	if not isinstance(companies, list) or not companies:
@@ -33,7 +37,8 @@ def parse_config(raw: object, base: Path) -> Config:
 			raise MirrorError("Each company must contain at least one repository.")
 		for repository in repositories:
 			sources.append(parse_source(repository, base, destination.path))
-	return Config(destination, tuple(sources))
+	history = parse_history(config["history"]) if "history" in config else HistoryWindow()
+	return Config(destination, tuple(sources), history)
 
 
 def parse_destination(raw: object, base: Path) -> Destination:
@@ -75,3 +80,20 @@ def parse_source(raw: object, base: Path, destination: Path) -> SourceRepository
 			raise MirrorError("Each source requires explicit author_emails.")
 		emails.append(email)
 	return SourceRepository(path, ref, tuple(emails))
+
+
+def parse_history(raw: object) -> HistoryWindow:
+	history = require_keys(raw, {"since", "until"}, "history")
+	dates: list[datetime.date | None] = []
+	for key in ("since", "until"):
+		value = history[key]
+		if value is None:
+			dates.append(None)
+		elif isinstance(value, str) and valid_date(value):
+			dates.append(datetime.date.fromisoformat(value))
+		else:
+			raise MirrorError(f"history.{key} must be a date in YYYY-MM-DD format or null.")
+	since, until = dates
+	if since and until and since > until:
+		raise MirrorError("history.since must not be after history.until.")
+	return HistoryWindow(since, until)

@@ -15,5 +15,9 @@
 				}
 			]
 		}
-	]
+	],
+	"history": {
+		"since": null,
+		"until": null
+	}
 }

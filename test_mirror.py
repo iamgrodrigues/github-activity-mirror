@@ -5,12 +5,14 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 import mirror
 from activity_mirror import destination as mirror_destination
+from activity_mirror import setup as mirror_setup
 from activity_mirror.config import parse_config
 from activity_mirror.models import Destination, GitIdentity
 
@@ -276,12 +278,202 @@ class MirrorTests(unittest.TestCase):
 		)
 		self.assertEqual(self.git(self.destination, "rev-list", "--count", "HEAD").strip(), "1")
 
+	def test_setup_preserves_existing_configuration_without_reading_sources(self):
+		config_path = self.root / "config.json"
+		original = json.dumps(self.config, default=str).encode()
+		config_path.write_bytes(original)
+		for answers in ("", "yes\n"):
+			with self.subTest(answers=answers):
+				result = subprocess.run(
+					[sys.executable, str(Path(mirror.__file__).resolve()), "--setup", "--config", str(config_path)],
+					input=answers, text=True, capture_output=True, env=self.environment()
+				)
+				self.assertEqual(config_path.read_bytes(), original)
+				self.assertFalse(self.destination.exists())
+				self.assertEqual(result.returncode, 0, result.stderr)
+				self.assertIn("unchanged", result.stdout)
+
+	def test_setup_saves_private_settings_and_previews_saved_history_before_explicit_apply(self):
+		self.commit("2023-12-31T10:00:00+00:00")
+		self.commit("2024-01-02T10:00:00+00:00")
+		self.commit("2024-02-02T10:00:00+00:00")
+		before = self.git(self.source, "rev-parse", "HEAD")
+		result = self.run_setup(self.setup_answers())
+		self.assertEqual(result.returncode, 0, result.stderr)
+		self.assertIn("Starting preview only", result.stdout)
+		self.assertIn("New mirror commits: 1", result.stdout)
+		self.assertFalse(self.destination.exists())
+		config_path = self.root / "config.wizard.json"
+		raw = json.loads(config_path.read_text())
+		self.assertEqual(raw["history"], {"since": "2024-01-01", "until": "2024-01-31"})
+		if os.name == "posix":
+			self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
+		expected = [{"date": "2024-01-02", "count": 1}]
+		plan, _ = json.JSONDecoder().raw_decode(result.stdout[result.stdout.index("{\n"):])
+		self.assertEqual(plan, {"daily_totals": expected, "new_mirror_commits": expected})
+		command = [sys.executable, str(Path(mirror.__file__).resolve()), "--config", str(config_path)]
+		repeated = subprocess.run(command, check=True, text=True, capture_output=True, env=self.environment())
+		self.assertEqual(json.loads(repeated.stdout)["new_mirror_commits"], expected)
+		override = subprocess.run(
+			command + ["--since", "2023-12-01", "--until", "2024-02-29"],
+			check=True, text=True, capture_output=True, env=self.environment()
+		)
+		self.assertEqual(len(json.loads(override.stdout)["new_mirror_commits"]), 3)
+		self.assertFalse(self.destination.exists())
+		subprocess.run(
+			command + ["--apply", "--allow-metadata-export"],
+			check=True, text=True, capture_output=True, env=self.environment()
+		)
+		self.assertEqual(self.git(self.destination, "log", "--format=%aI").splitlines(), [
+			"2024-01-02T12:00:00+00:00"
+		])
+		self.assertEqual(self.git(self.source, "rev-parse", "HEAD"), before)
+
+	def test_setup_cancellation_does_not_save_settings_or_create_a_destination(self):
+		self.commit("2024-01-02T10:00:00+00:00")
+		for answers in (["n"], ["y"], self.setup_answers()[:-1] + ["n"]):
+			with self.subTest(answers=answers):
+				result = self.run_setup(answers)
+				self.assertEqual(result.returncode, 0, result.stderr)
+				self.assertIn("cancelled", result.stdout)
+				self.assertFalse((self.root / "config.wizard.json").exists())
+				self.assertFalse(self.destination.exists())
+
+	def test_setup_retries_invalid_source_and_history_answers(self):
+		self.commit("2024-01-02T10:00:00+00:00")
+		answers = [
+			"y", "Personal Developer", "personal@example.test", str(self.destination),
+			str(self.root / "missing"), str(self.source), "", "work@example.test", "n",
+			"2024-02-30", "2024-02-01", "2024-01-31", "2024-01-01", "", "y"
+		]
+		result = self.run_setup(answers)
+		self.assertEqual(result.returncode, 0, result.stderr)
+		self.assertIn("Please correct the source", result.stdout)
+		self.assertIn("Use a real date", result.stdout)
+		self.assertIn("first date must not be after", result.stdout)
+		raw = json.loads((self.root / "config.wizard.json").read_text())
+		self.assertEqual(raw["history"], {"since": "2024-01-01", "until": "2024-01-31"})
+		self.assertFalse(self.destination.exists())
+
+	def test_setup_writer_never_replaces_files_and_cleans_up_failed_writes(self):
+		path = self.root / "config.wizard.json"
+		path.write_bytes(b"existing private settings")
+		with self.assertRaisesRegex(mirror.MirrorError, "left unchanged"):
+			mirror_setup.save_new_config(path, {"new": "settings"})
+		self.assertEqual(path.read_bytes(), b"existing private settings")
+		path.unlink()
+		with mock.patch.object(mirror_setup.os, "fsync", side_effect=OSError("Synthetic disk failure")):
+			with self.assertRaisesRegex(OSError, "Synthetic disk failure"):
+				mirror_setup.save_new_config(path, {"new": "settings"})
+		self.assertFalse(path.exists())
+
+	def test_setup_cannot_be_combined_with_apply_or_date_flags(self):
+		for flags in (
+			["--apply"], ["--allow-metadata-export"],
+			["--since", "2024-01-01"], ["--until", "2024-01-31"]
+		):
+			with self.subTest(flags=flags):
+				result = self.run_setup([], flags)
+				self.assertEqual(result.returncode, 1)
+				self.assertIn("cannot be combined", result.stderr)
+				self.assertFalse((self.root / "config.wizard.json").exists())
+				self.assertFalse(self.destination.exists())
+
+	def test_setup_refuses_to_save_settings_inside_a_source_or_mirror(self):
+		self.commit("2024-01-02T10:00:00+00:00")
+		for folder in (self.source, self.destination):
+			with self.subTest(folder=folder.name):
+				path = folder / "config.setup.json"
+				result = self.run_setup(self.setup_answers(), config_path=path)
+				self.assertEqual(result.returncode, 1)
+				self.assertIn("outside", result.stderr)
+				self.assertFalse(path.exists())
+		self.assertEqual(self.git(self.source, "status", "--porcelain"), "")
+		self.assertFalse(self.destination.exists())
+
+	def test_setup_supports_all_history_and_source_paths_with_spaces(self):
+		moved = self.root / "approved source"
+		self.source.rename(moved)
+		self.source = moved
+		self.commit("2023-01-02T10:00:00+00:00")
+		self.commit("2024-01-02T10:00:00+00:00")
+		result = self.run_setup([
+			"y", "Personal Developer", "personal@example.test", str(self.destination),
+			f'"{self.source}"', "", "work@example.test", "n", "all", "ongoing", "y"
+		])
+		self.assertEqual(result.returncode, 0, result.stderr)
+		raw = json.loads((self.root / "config.wizard.json").read_text())
+		self.assertEqual(raw["history"], {"since": None, "until": None})
+		plan, _ = json.JSONDecoder().raw_decode(result.stdout[result.stdout.index("{\n"):])
+		self.assertEqual(plan["new_mirror_commits"], [
+			{"date": "2023-01-02", "count": 1}, {"date": "2024-01-02", "count": 1}
+		])
+		self.assertEqual(self.git(self.source, "status", "--porcelain"), "")
+		self.assertFalse(self.destination.exists())
+
+	def test_saved_history_rejects_invalid_and_conflicting_limits_before_collection(self):
+		for history in (
+			{"since": "2024-02-30", "until": None},
+			{"since": None, "until": 2024},
+			{"since": "2024-02-01", "until": "2024-01-01"}
+		):
+			with self.subTest(history=history):
+				self.config["history"] = history
+				with self.assertRaisesRegex(mirror.MirrorError, "history."):
+					self.run_mirror(apply=True)
+				self.assertFalse(self.destination.exists())
+		self.config["history"] = {"since": "2024-01-01", "until": "2024-01-31"}
+		path = self.root / "config.wizard.json"
+		path.write_text(json.dumps(self.config, default=str))
+		result = subprocess.run(
+			[
+				sys.executable, str(Path(mirror.__file__).resolve()), "--config", str(path),
+				"--until", "2023-12-31"
+			], text=True, capture_output=True, env=self.environment()
+		)
+		self.assertEqual(result.returncode, 1)
+		self.assertIn("including saved history limits", result.stderr)
+		self.assertFalse(self.destination.exists())
+
+	def test_setup_reports_missing_git_before_prompting_or_saving(self):
+		path = self.root / "config.wizard.json"
+		with mock.patch.object(mirror_setup.shutil, "which", return_value=None):
+			with mock.patch("builtins.input") as prompt:
+				with self.assertRaisesRegex(mirror.MirrorError, "Git was not found"):
+					mirror_setup.configure(path)
+		prompt.assert_not_called()
+		self.assertFalse(path.exists())
+
+	def test_configuration_examples_are_accepted_by_the_loader(self):
+		root = Path(mirror.__file__).resolve().parent
+		mirror.load_config(root / "config.example.json")
+		manual = (root / "docs" / "manual-setup.md").read_text()
+		example = manual.split("```json\n", 1)[1].split("\n```", 1)[0]
+		parse_config(json.loads(example), self.root)
+
 	def run_mirror(self, **kwargs):
 		output = io.StringIO()
 		config = parse_config(json.loads(json.dumps(self.config, default=str)), self.root)
 		with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
 			mirror.run(config, **kwargs)
 		return json.loads(output.getvalue())
+
+	def run_setup(self, answers, extra=(), config_path=None):
+		return subprocess.run(
+			[
+				sys.executable, str(Path(mirror.__file__).resolve()), "--setup",
+				"--config", str(config_path or self.root / "config.wizard.json"), *extra
+			],
+			input="\n".join(answers) + "\n", text=True, capture_output=True,
+			cwd=self.root, env=self.environment()
+		)
+
+	def setup_answers(self):
+		return [
+			"y", "Personal Developer", "personal@example.test", str(self.destination),
+			str(self.source), "", "work@example.test", "n",
+			"2024-01-01", "2024-01-31", "y"
+		]
 
 	def commit(self, date, email="work@example.test", repository=None):
 		repository = repository or self.source

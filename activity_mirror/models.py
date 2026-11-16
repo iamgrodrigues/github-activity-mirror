@@ -27,9 +27,16 @@ class SourceRepository:
 
 
 @dataclass(frozen=True)
+class HistoryWindow:
+	since: datetime.date | None = None
+	until: datetime.date | None = None
+
+
+@dataclass(frozen=True)
 class Config:
 	destination: Destination
 	sources: tuple[SourceRepository, ...]
+	history: HistoryWindow = HistoryWindow()
 
 
 @dataclass(frozen=True)

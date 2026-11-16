@@ -15,11 +15,13 @@ from activity_mirror.config import load_config
 from activity_mirror.destination import inspect_destination, prepare_destination, write_commits
 from activity_mirror.ledger import DestinationLock, STATE_NAME, load_state, merge_activity, save_state
 from activity_mirror.models import Config, DailyCount, MirrorError, MirrorPlan
+from activity_mirror.setup import configure
 
 
 def main() -> int:
 	parser = argparse.ArgumentParser(description=__doc__)
 	parser.add_argument("--config", type=Path, default=Path("config.json"))
+	parser.add_argument("--setup", action="store_true", help="Guided local configuration and preview; never apply or push.")
 	parser.add_argument("--since", type=parse_date)
 	parser.add_argument("--until", type=parse_date)
 	parser.add_argument("--apply", action="store_true", help="Create local mirror commits.")
@@ -29,6 +31,17 @@ def main() -> int:
 	)
 	args = parser.parse_args()
 	try:
+		if args.setup:
+			if args.apply or args.allow_metadata_export or args.since or args.until:
+				raise MirrorError("--setup cannot be combined with apply/export/date flags; choose dates in the wizard.")
+			config = configure(args.config)
+			if config is not None:
+				plan = run(config)
+				print(f"\nActivity in plan: {sum(daily.count for daily in plan.daily_totals)}")
+				print(f"New mirror commits: {sum(daily.count for daily in plan.new_mirror_commits)}")
+				print("Review the plan. To import, rerun without --setup and add --apply --allow-metadata-export.")
+				print("Publishing remains a separate manual step.")
+			return 0
 		if args.since and args.until and args.since > args.until:
 			raise MirrorError("--since must not be after --until.")
 		if args.apply and not args.allow_metadata_export:
@@ -46,7 +59,11 @@ def run(
 	since: datetime.date | None = None,
 	until: datetime.date | None = None,
 	apply: bool = False
-) -> None:
+) -> MirrorPlan:
+	since = since if since is not None else config.history.since
+	until = until if until is not None else config.history.until
+	if since and until and since > until:
+		raise MirrorError("--since must not be after --until (including saved history limits).")
 	destination = config.destination
 	snapshot = inspect_destination(destination)
 	state_path = snapshot.git_dir / STATE_NAME
@@ -58,7 +75,7 @@ def run(
 	print(json.dumps(asdict(plan), indent="\t"))
 	if not apply:
 		print("Preview only. No files or repositories changed.", file=sys.stderr)
-		return
+		return plan
 	prepare_destination(destination, snapshot)
 	with DestinationLock(snapshot.git_dir):
 		current = inspect_destination(destination)
@@ -68,6 +85,7 @@ def run(
 		write_commits(destination, plan)
 	created = sum(daily.count for daily in plan.new_mirror_commits)
 	print(f"Created {created} local mirror commits. Nothing was pushed.", file=sys.stderr)
+	return plan
 
 
 def parse_date(value: str) -> datetime.date:
