@@ -76,7 +76,9 @@ See [daily scheduling](docs/scheduling.md) to check, change, stop, or troublesho
 
 With scheduling enabled, the local job imports and pushes automatically.
 Without it, follow [manual updates](docs/manual-setup.md#updating-next-time).
-Reruns skip already imported commits.
+Unchanged sources skip history scans; changed branches scan only newly reachable
+commits. The first import after upgrading builds this private checkpoint.
+See [incremental scanning](docs/manual-setup.md#faster-repeat-imports) for details.
 
 ## Safety and help
 

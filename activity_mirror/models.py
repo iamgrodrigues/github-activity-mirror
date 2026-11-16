@@ -1,6 +1,7 @@
 import datetime
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
 
 class MirrorError(Exception):
@@ -43,6 +44,12 @@ class Config:
 class SourceCommit:
 	commit_hash: str
 	date: str
+
+
+@dataclass(frozen=True)
+class CollectedActivity:
+	commits: tuple[SourceCommit, ...]
+	checkpoints: Mapping[str, str]
 
 
 @dataclass(frozen=True)

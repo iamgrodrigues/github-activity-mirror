@@ -15,6 +15,7 @@ from unittest import mock
 import xml.etree.ElementTree as ET
 
 import mirror
+from activity_mirror import collector as mirror_collector
 from activity_mirror import destination as mirror_destination
 from activity_mirror import setup as mirror_setup
 from activity_mirror import publishing as mirror_publishing
@@ -130,6 +131,125 @@ class MirrorTests(unittest.TestCase):
 			{"date": "2024-01-01", "count": 1}, {"date": "2024-01-02", "count": 1}
 		])
 
+	def test_unchanged_sources_skip_history_scans_and_preview_keeps_checkpoints_read_only(self):
+		self.commit("2024-01-01T10:00:00+00:00")
+		self.run_mirror(apply=True)
+		state = {
+			path.name: path.read_bytes()
+			for path in (self.destination / ".git").glob("activity-mirror-*.json")
+		}
+		with mock.patch.object(mirror_collector, "git", wraps=mirror_collector.git) as commands:
+			preview = self.run_mirror()
+			self.assertEqual({
+				path.name: path.read_bytes()
+				for path in (self.destination / ".git").glob("activity-mirror-*.json")
+			}, state)
+			self.assertEqual(self.run_mirror(apply=True), preview)
+		self.assertEqual(preview["daily_totals"], [{"date": "2024-01-01", "count": 1}])
+		self.assertEqual(preview["new_mirror_commits"], [])
+		self.assertEqual([call for call in commands.call_args_list if call.args[1][0] == "log"], [])
+		for path in (self.destination / ".git").glob("activity-mirror-*.json"):
+			self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+	def test_incremental_scan_reads_only_new_history_including_backdated_merged_commits(self):
+		self.commit("2024-01-02T10:00:00+00:00")
+		self.git(self.source, "checkout", "-b", "older-feature")
+		backdated = self.commit("2024-01-01T10:00:00+00:00")
+		self.git(self.source, "checkout", "main")
+		self.run_mirror(apply=True)
+		new = self.commit("2024-01-03T10:00:00+00:00")
+		self.git(
+			self.source, "-c", "user.name=Work Developer", "-c", "user.email=work@example.test",
+			"-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false",
+			"merge", "--no-ff", "-s", "ours", "-m", "Synthetic merge", "older-feature"
+		)
+		scanned = []
+		original_git = mirror_collector.git
+
+		def record_scan(path, arguments):
+			output = original_git(path, arguments)
+			if arguments[0] == "log":
+				scanned.extend(line.split("\x00")[0] for line in output.splitlines())
+			return output
+
+		with mock.patch.object(mirror_collector, "git", side_effect=record_scan):
+			result = self.run_mirror(apply=True)
+		self.assertEqual(set(scanned), {backdated, new})
+		self.assertEqual(result["new_mirror_commits"], [
+			{"date": "2024-01-01", "count": 1}, {"date": "2024-01-03", "count": 1}
+		])
+		self.assertEqual(self.git(self.destination, "rev-list", "--count", "HEAD").strip(), "3")
+
+	def test_scan_checkpoints_invalidate_when_author_filters_or_history_limits_change(self):
+		self.commit("2023-01-01T10:00:00+00:00")
+		self.commit("2024-01-01T10:00:00+00:00")
+		self.commit("2024-01-02T10:00:00+00:00", email="other@example.test")
+		self.run_mirror(since=datetime.date(2024, 1, 1), apply=True)
+		backfill = self.run_mirror(since=datetime.date(2023, 1, 1), apply=True)
+		self.assertEqual(backfill["new_mirror_commits"], [{"date": "2023-01-01", "count": 1}])
+		self.config["companies"][0]["repositories"][0]["author_emails"].append("other@example.test")
+		result = self.run_mirror(since=datetime.date(2023, 1, 1), apply=True)
+		self.assertEqual(result["new_mirror_commits"], [{"date": "2024-01-02", "count": 1}])
+		self.assertEqual(self.git(self.destination, "rev-list", "--count", "HEAD").strip(), "3")
+
+	def test_rewritten_sources_and_unavailable_checkpoints_keep_old_activity_without_missing_new_commits(self):
+		self.commit("2024-01-01T10:00:00+00:00")
+		self.run_mirror(apply=True)
+		self.git(self.source, "checkout", "--orphan", "rewritten")
+		rewritten = self.commit("2024-01-02T10:00:00+00:00")
+		self.git(self.source, "update-ref", "refs/heads/main", rewritten)
+		self.git(self.source, "checkout", "main")
+		self.assertEqual(self.run_mirror(apply=True)["new_mirror_commits"], [
+			{"date": "2024-01-02", "count": 1}
+		])
+		cache_path = self.destination / ".git" / mirror.SCAN_NAME
+		cache = json.loads(cache_path.read_text())
+		cache["checkpoints"] = {key: "f" * 40 for key in cache["checkpoints"]}
+		cache_path.write_text(json.dumps(cache))
+		self.commit("2024-01-03T10:00:00+00:00")
+		self.assertEqual(self.run_mirror(apply=True)["new_mirror_commits"], [
+			{"date": "2024-01-03", "count": 1}
+		])
+		self.assertEqual(self.git(self.destination, "rev-list", "--count", "HEAD").strip(), "3")
+
+	def test_deepening_a_shallow_source_backfills_history_even_when_its_tip_is_unchanged(self):
+		self.commit("2024-01-01T10:00:00+00:00")
+		tip = self.commit("2024-01-02T10:00:00+00:00")
+		shallow = self.root / "shallow"
+		self.git(self.root, "clone", "--depth", "1", self.source.as_uri(), str(shallow))
+		self.config["companies"][0]["repositories"][0]["path"] = shallow
+		self.run_mirror(apply=True)
+		self.git(shallow, "fetch", "--unshallow", "origin")
+		self.assertEqual(self.git(shallow, "rev-parse", "HEAD").strip(), tip)
+		self.assertEqual(self.run_mirror(apply=True)["new_mirror_commits"], [
+			{"date": "2024-01-01", "count": 1}
+		])
+		self.assertEqual(self.git(self.destination, "rev-list", "--count", "HEAD").strip(), "2")
+
+	def test_incremental_import_rejects_concurrent_ledger_changes_before_saving_checkpoints(self):
+		self.commit("2024-01-01T10:00:00+00:00")
+		self.run_mirror(apply=True)
+		cache_path = self.destination / ".git" / mirror.SCAN_NAME
+		cache_before = cache_path.read_bytes()
+		self.commit("2024-01-02T10:00:00+00:00")
+		state_path = self.destination / ".git" / mirror.STATE_NAME
+		concurrent_state = json.loads(state_path.read_text())
+		concurrent_state["commits"]["f" * 40] = "2024-01-03"
+		original_lock = mirror.DestinationLock
+
+		@contextlib.contextmanager
+		def concurrent_update(git_dir):
+			with original_lock(git_dir) as acquired:
+				state_path.write_text(json.dumps(concurrent_state))
+				yield acquired
+
+		with mock.patch.object(mirror, "DestinationLock", concurrent_update):
+			with self.assertRaisesRegex(mirror.MirrorError, "ledger changed during collection"):
+				self.run_mirror(apply=True)
+		self.assertEqual(json.loads(state_path.read_text()), concurrent_state)
+		self.assertEqual(cache_path.read_bytes(), cache_before)
+		self.assertEqual(self.git(self.destination, "rev-list", "--count", "HEAD").strip(), "1")
+
 	def test_apply_rejects_rewritten_destination_even_when_daily_counts_match(self):
 		self.commit("2024-01-01T10:00:00+00:00")
 		self.run_mirror(apply=True)
@@ -203,6 +323,7 @@ class MirrorTests(unittest.TestCase):
 		with mock.patch.object(mirror_destination, "git", interrupted_git):
 			with self.assertRaisesRegex(mirror.MirrorError, "Synthetic write interruption"):
 				self.run_mirror(apply=True)
+		self.assertFalse((self.destination / ".git" / mirror.SCAN_NAME).exists())
 		self.assertEqual(self.git(self.destination, "rev-list", "--count", "HEAD").strip(), "1")
 		state = json.loads((self.destination / ".git" / mirror.STATE_NAME).read_text())
 		self.assertEqual(len(state["commits"]), 2)
