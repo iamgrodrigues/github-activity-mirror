@@ -1,0 +1,19 @@
+{
+	"destination": {
+		"path": "./local/mirror",
+		"author_name": "Your personal Git name",
+		"author_email": "YOUR_ID+YOUR_USERNAME@users.noreply.github.com"
+	},
+	"companies": [
+		{
+			"name": "example-company",
+			"repositories": [
+				{
+					"path": "/absolute/path/to/an/approved/local/repository",
+					"ref": "origin/main",
+					"author_emails": ["your-approved-work-email@example.com"]
+				}
+			]
+		}
+	]
+}

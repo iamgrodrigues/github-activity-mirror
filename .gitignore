@@ -1,0 +1,6 @@
+/config.json
+/config.*.json
+!/config.example.json
+/local/
+__pycache__/
+*.pyc
