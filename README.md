@@ -5,7 +5,7 @@ without copying source code or changing the original repositories.
 
 **No Python knowledge or JSON editing is needed.** The guided setup asks a few
 questions, saves your settings, and shows a preview. It never imports or pushes
-automatically.
+automatically. Daily automation is a separate, optional step below.
 
 > Get permission to export activity dates and counts before using real sources.
 > A private destination does not replace that permission.
@@ -95,7 +95,7 @@ is stored in Git history, not files. Do not add a README or other files there.
 ## Put it on your profile
 
 Local imports do not update GitHub until you push the **separate private personal
-data repository**. Account verification and publishing are intentionally manual:
+data repository**. For the first publication, verify your account and destination:
 follow [Publish your private mirror](docs/manual-setup.md#7-publish-to-your-private-personal-repository).
 Never push a source repository or configuration as the data mirror.
 
@@ -109,8 +109,39 @@ Run `python3 mirror.py` to preview using your saved settings, then use the apply
 command above only if you approve the result. On Windows, use `python` instead.
 Push separately after verifying your personal account and destination again.
 
-Nothing runs on a schedule. Repeated or overlapping imports are deduplicated.
+Nothing runs automatically unless you enable the optional schedule below.
+Repeated or overlapping imports are deduplicated.
 Changing the date window never removes already imported activity.
+
+## Optional: update automatically every day
+
+After your private mirror is connected to GitHub, install
+[GitHub CLI](https://cli.github.com/) if needed, then run:
+
+```bash
+python3 mirror.py --schedule install
+```
+
+On Windows, use `python`. The wizard asks for your personal data repository,
+daily time (**midnight** by default; enter `12:00` for noon), approved history
+dates, and recurring export/push permission. It installs a job for your user,
+not a cloud workflow.
+Sources are never fetched; keep their local refs current through your normal
+approved workflow.
+
+Check or stop the job with:
+
+```bash
+python3 mirror.py --schedule status
+python3 mirror.py --schedule remove
+```
+
+To change the time, remove the schedule and install it again.
+Your computer must be running; on Linux/WSL, cron and the Linux environment must
+also be running. This does not wake or turn on the computer.
+Linux has been verified; the macOS and Windows adapters are experimental.
+See [daily scheduling](docs/scheduling.md) for platform support, missed runs,
+authentication, private state, and recovery.
 
 ## Safety and help
 

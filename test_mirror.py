@@ -1,18 +1,25 @@
 import contextlib
+from dataclasses import replace
 import datetime
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import plistlib
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
+import xml.etree.ElementTree as ET
 
 import mirror
 from activity_mirror import destination as mirror_destination
 from activity_mirror import setup as mirror_setup
+from activity_mirror import publishing as mirror_publishing
+from activity_mirror import schedule as mirror_schedule
+from activity_mirror import schedulers as native_schedulers
 from activity_mirror.config import parse_config
 from activity_mirror.models import Destination, GitIdentity
 
@@ -451,6 +458,323 @@ class MirrorTests(unittest.TestCase):
 		example = manual.split("```json\n", 1)[1].split("\n```", 1)[0]
 		parse_config(json.loads(example), self.root)
 
+	def test_scheduled_run_requires_both_stored_approvals_before_import_or_push(self):
+		path = self.scheduled_settings()
+		job = json.loads(path.read_text())
+		for permission in ("export_approved", "publish_approved"):
+			with self.subTest(permission=permission):
+				path.write_text(json.dumps({**job, permission: False}))
+				with mock.patch.object(mirror_schedule, "verify_destination") as verify:
+					with mock.patch.object(mirror_schedule, "publish") as push:
+						importer = mock.Mock()
+						with self.assertRaisesRegex(mirror.MirrorError, "approval"):
+							mirror_schedule.run_scheduled(path, importer)
+				verify.assert_not_called()
+				importer.assert_not_called()
+				push.assert_not_called()
+
+	def test_scheduled_approval_does_not_cover_changed_source_settings(self):
+		path = self.scheduled_settings()
+		self.config["companies"][0]["repositories"][0]["ref"] = "different-ref"
+		(self.root / "config.json").write_text(json.dumps(self.config, default=str))
+		with mock.patch.object(mirror_schedule, "verify_destination") as verify:
+			with mock.patch.object(mirror_schedule, "publish") as push:
+				importer = mock.Mock()
+				with self.assertRaisesRegex(mirror.MirrorError, "changed"):
+					mirror_schedule.run_scheduled(path, importer)
+		verify.assert_not_called()
+		importer.assert_not_called()
+		push.assert_not_called()
+
+	def test_scheduled_run_uses_only_approved_history_and_does_not_push_failed_imports(self):
+		self.commit("2023-12-31T10:00:00+00:00")
+		self.commit("2024-01-02T10:00:00+00:00")
+		self.commit("2024-02-02T10:00:00+00:00")
+		path = self.scheduled_settings()
+		with mock.patch.object(mirror_schedule, "verify_destination"):
+			with mock.patch.object(mirror_schedule, "publish", return_value=True) as push:
+				with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+					mirror_schedule.run_scheduled(path, lambda config: mirror.run(config, apply=True))
+				push.assert_called_once()
+		self.assertEqual(self.git(self.destination, "log", "--format=%aI").splitlines(), [
+			"2024-01-02T12:00:00+00:00"
+		])
+		with mock.patch.object(mirror_schedule, "verify_destination"):
+			with mock.patch.object(mirror_schedule, "publish") as push:
+				with self.assertRaisesRegex(mirror.MirrorError, "Synthetic import failure"):
+					mirror_schedule.run_scheduled(path, mock.Mock(side_effect=mirror.MirrorError("Synthetic import failure")))
+				push.assert_not_called()
+
+	def test_publishing_rejects_unexpected_remote_account_or_public_target(self):
+		self.commit("2024-01-02T10:00:00+00:00")
+		self.config["destination"]["author_email"] = "personal-developer@users.noreply.github.com"
+		self.run_mirror(apply=True)
+		self.git(self.destination, "remote", "add", "origin", "https://github.com/personal-developer/activity-data.git")
+		destination = Destination(
+			self.destination, GitIdentity("Personal Developer", "personal-developer@users.noreply.github.com")
+		)
+		account = {"login": "personal-developer", "type": "User"}
+		repository = {
+			"full_name": "personal-developer/activity-data", "private": True,
+			"owner": account, "fork": False, "archived": False,
+			"disabled": False, "default_branch": "main", "permissions": {"push": True}
+		}
+		for case in ("remote", "push-url", "account", "public"):
+			with self.subTest(case=case):
+				self.git(self.destination, "remote", "set-url", "origin", (
+					"https://github.com/other-owner/activity-data.git" if case == "remote"
+					else "https://github.com/personal-developer/activity-data.git"
+				))
+				self.git(self.destination, "config", "remote.origin.pushurl", (
+					"https://github.com/other-owner/activity-data.git" if case == "push-url"
+					else "https://github.com/personal-developer/activity-data.git"
+				))
+				responses = [
+					{"login": "other-owner", "type": "User"} if case == "account" else account,
+					{**repository, "private": False} if case == "public" else repository
+				]
+				with mock.patch.object(mirror_publishing, "github", side_effect=responses):
+					with self.assertRaises(mirror.MirrorError):
+						mirror_publishing.verify_destination(destination, "personal-developer/activity-data")
+
+	def test_scheduled_run_retries_failed_push_without_duplicating_local_history(self):
+		self.commit("2024-01-02T10:00:00+00:00")
+		path = self.scheduled_settings()
+		with mock.patch.object(mirror_schedule, "verify_destination"):
+			with mock.patch.object(mirror_schedule, "publish", side_effect=[
+				mirror.MirrorError("Synthetic failed push"), True
+			]) as publish:
+				with self.assertRaisesRegex(mirror.MirrorError, "Synthetic failed push"):
+					mirror_schedule.run_scheduled(path, lambda config: mirror.run(config, apply=True))
+				head = self.git(self.destination, "rev-parse", "HEAD")
+				failed = json.loads((self.root / "last-run.json").read_text())
+				self.assertFalse(failed["success"])
+				mirror_schedule.run_scheduled(path, lambda config: mirror.run(config, apply=True))
+				self.assertEqual(publish.call_count, 2)
+		self.assertEqual(self.git(self.destination, "rev-parse", "HEAD"), head)
+		result = json.loads((self.root / "last-run.json").read_text())
+		self.assertTrue(result["success"])
+		self.assertTrue(result["published"])
+		self.assertEqual(result["created"], 0)
+		if os.name == "posix":
+			self.assertEqual((self.root / "last-run.json").stat().st_mode & 0o777, 0o600)
+
+	def test_scheduler_cancellation_does_not_save_or_register_a_job(self):
+		path = self.scheduled_settings()
+		config = self.root / "config.json"
+		original = config.read_bytes()
+		path.unlink()
+		answers = ["personal-developer/activity-data", "", "", "", "n"]
+		with mock.patch.object(mirror_schedule.shutil, "which", return_value="/synthetic/tool"):
+			with mock.patch("builtins.input", side_effect=answers):
+				with mock.patch.object(native_schedulers, "install") as install:
+					with mock.patch.object(mirror_schedule, "verify_destination") as verify:
+						with contextlib.redirect_stdout(io.StringIO()):
+							mirror_schedule.install_schedule(config, Path(mirror.__file__).resolve(), path)
+		install.assert_not_called()
+		verify.assert_not_called()
+		self.assertFalse(path.exists())
+		self.assertEqual(config.read_bytes(), original)
+		self.assertFalse(self.destination.exists())
+
+	def test_revoked_approval_still_allows_removing_the_managed_schedule(self):
+		path = self.scheduled_settings()
+		raw = json.loads(path.read_text())
+		raw["publish_approved"] = False
+		path.write_text(json.dumps(raw))
+		with mock.patch.object(mirror_schedule, "state_directory", return_value=self.root):
+			with mock.patch.object(native_schedulers, "status", return_value="Registered"):
+				output = io.StringIO()
+				with contextlib.redirect_stdout(output):
+					mirror_schedule.manage_schedule("status", self.root / "config.json", Path(mirror.__file__).resolve())
+				self.assertIn("approval is revoked", output.getvalue())
+			with mock.patch.object(native_schedulers, "remove") as remove:
+				with contextlib.redirect_stdout(io.StringIO()):
+					mirror_schedule.manage_schedule("remove", self.root / "config.json", Path(mirror.__file__).resolve())
+				remove.assert_called_once()
+		self.assertFalse(path.exists())
+		self.assertTrue((self.root / "config.json").exists())
+
+	def test_native_install_and_removal_refuse_existing_or_modified_definitions(self):
+		path = self.scheduled_settings()
+		job = mirror_schedule.load_job(path)
+		with mock.patch.object(native_schedulers.sys, "platform", "linux"):
+			with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root / "user-config")}):
+				files = native_schedulers.definitions(job, path)
+				service = next(iter(files))
+				service.parent.mkdir(parents=True, exist_ok=True)
+				service.write_bytes(b"Unrelated existing user service\n")
+				with mock.patch.object(native_schedulers, "command") as command:
+					with self.assertRaisesRegex(mirror.MirrorError, "not overwritten"):
+						native_schedulers.install(job, path)
+					with self.assertRaisesRegex(mirror.MirrorError, "unverified"):
+						native_schedulers.remove(job, path)
+					command.assert_not_called()
+				self.assertEqual(service.read_bytes(), b"Unrelated existing user service\n")
+
+	def test_macos_and_windows_definitions_preserve_argument_boundaries_and_daily_time(self):
+		path = self.scheduled_settings()
+		job = replace(
+			mirror_schedule.load_job(path), time="00:00",
+			script=self.root / "folder & $percent%" / "mirror script.py"
+		)
+		with mock.patch.object(native_schedulers.sys, "platform", "darwin"):
+			plist = plistlib.loads(next(iter(native_schedulers.definitions(job, path).values())))
+			self.assertEqual(plist["ProgramArguments"], [
+				str(job.python), str(job.script), "--scheduled-run", str(path)
+			])
+			self.assertEqual(plist["WorkingDirectory"], str(job.script.parent))
+			self.assertEqual(plist["StartCalendarInterval"], {"Hour": 0, "Minute": 0})
+		with mock.patch.object(native_schedulers, "windows_user_sid", return_value="S-1-5-21-123"):
+			xml = native_schedulers.windows_definition(job, path)
+		root = ET.fromstring(xml)
+		self.assertEqual(root.findtext("t:Actions/t:Exec/t:Command", namespaces=native_schedulers.TASK_NS), str(job.python))
+		self.assertEqual(root.findtext(
+			"t:Actions/t:Exec/t:WorkingDirectory", namespaces=native_schedulers.TASK_NS
+		), str(job.script.parent))
+		self.assertEqual(root.findtext(
+			"t:Triggers/t:CalendarTrigger/t:StartBoundary", namespaces=native_schedulers.TASK_NS
+		), "2024-01-01T00:00:00")
+		arguments = root.findtext("t:Actions/t:Exec/t:Arguments", namespaces=native_schedulers.TASK_NS)
+		self.assertIn(f'"{job.script}"', arguments)
+		self.assertIn(f'--scheduled-run {path}', arguments)
+
+	def test_windows_registration_never_forces_replacement_and_removal_checks_actual_actions(self):
+		path = self.scheduled_settings()
+		job = mirror_schedule.load_job(path)
+		with mock.patch.object(native_schedulers.sys, "platform", "win32"):
+			with mock.patch.object(native_schedulers, "windows_user_sid", return_value="S-1-5-21-123"):
+				with mock.patch.object(native_schedulers, "command") as command:
+					native_schedulers.install(job, path)
+					arguments = command.call_args.args[0]
+					self.assertNotIn("/F", arguments)
+					self.assertEqual(command.call_args.kwargs["answer"], "N\n")
+				root = ET.fromstring((self.root / "task.xml").read_bytes())
+				root.find("t:Actions/t:Exec/t:Command", native_schedulers.TASK_NS).text = "unrelated.exe"
+				output = ET.tostring(root, encoding="unicode")
+				with mock.patch.object(native_schedulers, "command", return_value=subprocess.CompletedProcess(
+					[], 0, output, ""
+				)) as command:
+					with self.assertRaisesRegex(mirror.MirrorError, "differs"):
+						native_schedulers.remove(job, path)
+					self.assertEqual(command.call_count, 1)
+					self.assertIn("/Query", command.call_args.args[0])
+				self.assertTrue((self.root / "task.xml").exists())
+
+	def test_native_boundary_decodes_utf16_task_xml_without_corrupting_paths(self):
+		payload = '<?xml version="1.0" encoding="UTF-16"?><Task><Path>Ren\u00e9e &amp; scripts</Path></Task>'
+		with mock.patch.object(native_schedulers.subprocess, "run", return_value=subprocess.CompletedProcess(
+			[], 0, payload.encode("utf-16"), b""
+		)):
+			result = native_schedulers.command(["schtasks", "/Query", "/XML"])
+		self.assertEqual(ET.fromstring(result.stdout).findtext("Path"), "Ren\u00e9e & scripts")
+
+	def test_macos_removal_rejects_a_registered_path_that_only_shares_the_expected_prefix(self):
+		path = self.scheduled_settings()
+		job = mirror_schedule.load_job(path)
+		target = self.root / "agent.plist"
+		target.write_bytes(b"owned native definition")
+		with mock.patch.object(native_schedulers.sys, "platform", "darwin"):
+			with mock.patch.object(native_schedulers, "definitions", return_value={target: target.read_bytes()}):
+				with mock.patch.object(native_schedulers, "command", return_value=subprocess.CompletedProcess(
+					[], 0, f"  path = {target}.unrelated\n", ""
+				)) as command:
+					with self.assertRaisesRegex(mirror.MirrorError, "does not belong"):
+						native_schedulers.remove(job, path)
+					self.assertEqual(command.call_count, 1)
+					self.assertIn("print", command.call_args.args[0])
+
+	def test_linux_cron_install_status_and_removal_preserve_unrelated_jobs(self):
+		path = self.scheduled_settings()
+		job = mirror_schedule.load_job(path)
+		before = "MAILTO=personal@example.test\nSHELL=/bin/bash\n17 8 * * 1 printf unrelated\n"
+		with mock.patch.object(native_schedulers.sys, "platform", "linux"):
+			with mock.patch.object(native_schedulers, "read_crontab", side_effect=[before, before]):
+				with mock.patch.object(native_schedulers, "command") as command:
+					native_schedulers.install(job, path)
+					after = command.call_args.kwargs["answer"]
+					self.assertEqual(command.call_args.args[0], ["crontab", "-"])
+					self.assertEqual(after, before + native_schedulers.cron_block(job, path))
+			with mock.patch.object(native_schedulers, "read_crontab", return_value=after):
+				self.assertIn("registered", native_schedulers.status(job, path))
+				with mock.patch.object(native_schedulers, "command") as command:
+					native_schedulers.remove(job, path)
+					self.assertEqual(command.call_args.kwargs["answer"], before)
+			self.assertFalse((self.root / "crontab.txt").exists())
+
+	def test_linux_cron_does_not_replace_concurrent_edits_or_modified_managed_blocks(self):
+		path = self.scheduled_settings()
+		job = mirror_schedule.load_job(path)
+		before = "17 8 * * 1 printf unrelated\n"
+		changed = before + "42 9 * * 2 printf another\n"
+		with mock.patch.object(native_schedulers, "read_crontab", return_value=changed):
+			with mock.patch.object(native_schedulers, "command") as command:
+				with self.assertRaisesRegex(mirror.MirrorError, "changed"):
+					native_schedulers.write_crontab(before, "replacement")
+				command.assert_not_called()
+		table = native_schedulers.cron_block(job, path).replace("--scheduled-run", "--unrelated")
+		with self.assertRaisesRegex(mirror.MirrorError, "missing or changed"):
+			native_schedulers.verify_cron_block(table, job, path)
+
+	def test_linux_cron_distinguishes_empty_table_from_access_failures(self):
+		for result, empty in (
+			(subprocess.CompletedProcess([], 1, "", "no crontab for example-user\n"), True),
+			(subprocess.CompletedProcess([], 1, "", "permission denied\n"), False)
+		):
+			with self.subTest(empty=empty):
+				with mock.patch.object(native_schedulers, "command", return_value=result):
+					if empty:
+						self.assertEqual(native_schedulers.read_crontab(), "")
+					else:
+						with self.assertRaisesRegex(mirror.MirrorError, "left unchanged"):
+							native_schedulers.read_crontab()
+
+	def test_linux_cron_refuses_inherited_timezone_delay_or_incompatible_shell(self):
+		path = self.scheduled_settings()
+		job = mirror_schedule.load_job(path)
+		for table in ("CRON_TZ=UTC\n", "RANDOM_DELAY=60\n", "SHELL=/bin/csh\n"):
+			with self.subTest(table=table):
+				with mock.patch.object(native_schedulers.sys, "platform", "linux"):
+					with mock.patch.object(native_schedulers, "read_crontab", return_value=table):
+						with mock.patch.object(native_schedulers, "command") as command:
+							with self.assertRaises(mirror.MirrorError):
+								native_schedulers.install(job, path)
+							command.assert_not_called()
+							self.assertFalse((self.root / "crontab.txt").exists())
+
+	def test_publishing_sends_only_the_validated_tip_without_overriding_existing_authentication(self):
+		destination = Destination(self.destination, GitIdentity("Personal Developer", "personal@example.test"))
+		head = "a" * 40
+		with mock.patch.object(mirror_publishing, "verify_destination", return_value=head):
+			with mock.patch.object(mirror_publishing, "git") as git:
+				self.assertTrue(mirror_publishing.publish(destination, "personal-developer/activity-data"))
+		arguments = git.call_args.args[1]
+		index = arguments.index("push")
+		self.assertEqual(arguments[index + 1:], [
+			"--no-verify", "--recurse-submodules=no", "--porcelain", "origin", f"{head}:refs/heads/main"
+		])
+		self.assertNotIn("--force", arguments)
+		self.assertFalse(any("credential." in item or "extraHeader" in item for item in arguments))
+		self.assertEqual(git.call_args.kwargs["timeout"], 120)
+
+	def test_scheduler_cli_rejects_conflicting_flags_and_status_does_not_read_sources(self):
+		path = self.scheduled_settings()
+		command = [sys.executable, str(Path(mirror.__file__).resolve())]
+		for flags in (
+			["--scheduled-run", str(path), "--apply"],
+			["--schedule", "install", "--since", "2024-01-01"],
+			["--schedule", "status", "--setup"]
+		):
+			with self.subTest(flags=flags):
+				result = subprocess.run(command + flags, text=True, capture_output=True, env=self.environment())
+				self.assertEqual(result.returncode, 1)
+				self.assertIn("cannot be combined", result.stderr)
+		env = {**self.environment(), "HOME": str(self.root), "LOCALAPPDATA": str(self.root)}
+		result = subprocess.run(command + ["--schedule", "status"], text=True, capture_output=True, env=env)
+		self.assertEqual(result.returncode, 0, result.stderr)
+		self.assertIn("No managed daily schedule", result.stdout)
+		self.assertFalse(self.destination.exists())
+
 	def run_mirror(self, **kwargs):
 		output = io.StringIO()
 		config = parse_config(json.loads(json.dumps(self.config, default=str)), self.root)
@@ -474,6 +798,23 @@ class MirrorTests(unittest.TestCase):
 			str(self.source), "", "work@example.test", "n",
 			"2024-01-01", "2024-01-31", "y"
 		]
+
+	def scheduled_settings(self):
+		config_path = self.root / "config.json"
+		config_path.write_text(json.dumps(self.config, default=str))
+		job = {
+			"version": 1, "config": str(config_path),
+			"config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+			"repository": "personal-developer/activity-data",
+			"history": {"since": "2024-01-01", "until": "2024-01-31"},
+			"export_approved": True, "publish_approved": True,
+			"time": "00:00", "python": sys.executable,
+			"script": str(Path(mirror.__file__).resolve()),
+			"path": os.environ.get("PATH", ""), "start_date": "2024-01-01"
+		}
+		path = self.root / "job.json"
+		path.write_text(json.dumps(job))
+		return path
 
 	def commit(self, date, email="work@example.test", repository=None):
 		repository = repository or self.source

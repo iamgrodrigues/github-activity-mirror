@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Preview and locally mirror daily activity without exporting source metadata."""
+"""Preview approved local activity and optionally schedule personal mirror publishing."""
 
 import argparse
 import collections
@@ -15,6 +15,7 @@ from activity_mirror.config import load_config
 from activity_mirror.destination import inspect_destination, prepare_destination, write_commits
 from activity_mirror.ledger import DestinationLock, STATE_NAME, load_state, merge_activity, save_state
 from activity_mirror.models import Config, DailyCount, MirrorError, MirrorPlan
+from activity_mirror.schedule import manage_schedule, run_scheduled
 from activity_mirror.setup import configure
 
 
@@ -22,6 +23,8 @@ def main() -> int:
 	parser = argparse.ArgumentParser(description=__doc__)
 	parser.add_argument("--config", type=Path, default=Path("config.json"))
 	parser.add_argument("--setup", action="store_true", help="Guided local configuration and preview; never apply or push.")
+	parser.add_argument("--schedule", choices=("install", "status", "remove"), help="Manage optional daily local import and push.")
+	parser.add_argument("--scheduled-run", type=Path, help=argparse.SUPPRESS)
 	parser.add_argument("--since", type=parse_date)
 	parser.add_argument("--until", type=parse_date)
 	parser.add_argument("--apply", action="store_true", help="Create local mirror commits.")
@@ -31,6 +34,18 @@ def main() -> int:
 	)
 	args = parser.parse_args()
 	try:
+		if args.schedule or args.scheduled_run:
+			if (
+				(args.schedule and args.scheduled_run) or args.setup or args.apply
+				or args.allow_metadata_export or args.since or args.until
+				or ((args.scheduled_run or args.schedule != "install") and args.config != Path("config.json"))
+			):
+				raise MirrorError("Scheduler commands cannot be combined with setup/apply/export/date flags or unrelated config overrides.")
+			if args.scheduled_run:
+				run_scheduled(args.scheduled_run, lambda config: run(config, apply=True))
+			else:
+				manage_schedule(args.schedule, args.config, Path(__file__).resolve())
+			return 0
 		if args.setup:
 			if args.apply or args.allow_metadata_export or args.since or args.until:
 				raise MirrorError("--setup cannot be combined with apply/export/date flags; choose dates in the wizard.")
