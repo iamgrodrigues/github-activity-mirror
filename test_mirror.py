@@ -7,8 +7,12 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 import mirror
+from activity_mirror import destination as mirror_destination
+from activity_mirror.config import parse_config
+from activity_mirror.models import Destination, GitIdentity
 
 
 class MirrorTests(unittest.TestCase):
@@ -117,6 +121,88 @@ class MirrorTests(unittest.TestCase):
 			{"date": "2024-01-01", "count": 1}, {"date": "2024-01-02", "count": 1}
 		])
 
+	def test_apply_rejects_rewritten_destination_even_when_daily_counts_match(self):
+		self.commit("2024-01-01T10:00:00+00:00")
+		self.run_mirror(apply=True)
+		self.commit("2024-01-02T10:00:00+00:00")
+		state = self.destination / ".git" / mirror.STATE_NAME
+		before_state = state.read_bytes()
+		original_head = self.git(self.destination, "rev-parse", "HEAD")
+		original_lock = mirror.DestinationLock
+
+		@contextlib.contextmanager
+		def concurrent_rewrite(git_dir):
+			with original_lock(git_dir) as acquired:
+				env = self.environment()
+				env.update({
+					"GIT_AUTHOR_NAME": "Personal Developer",
+					"GIT_AUTHOR_EMAIL": "personal@example.test",
+					"GIT_AUTHOR_DATE": "2024-01-01T12:00:00+00:00",
+					"GIT_COMMITTER_NAME": "Personal Developer",
+					"GIT_COMMITTER_EMAIL": "personal@example.test",
+					"GIT_COMMITTER_DATE": "2024-01-01T13:00:00+00:00"
+				})
+				subprocess.run([
+					"git", "-C", str(self.destination), "-c", "core.hooksPath=/dev/null",
+					"-c", "commit.gpgSign=false", "commit", "--amend", "--no-edit",
+					"--allow-empty", "--quiet"
+				], env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+				self.assertNotEqual(self.git(self.destination, "rev-parse", "HEAD"), original_head)
+				yield acquired
+
+		with mock.patch.object(mirror, "DestinationLock", concurrent_rewrite):
+			with self.assertRaisesRegex(mirror.MirrorError, "changed during collection"):
+				self.run_mirror(apply=True)
+		self.assertEqual(state.read_bytes(), before_state)
+		self.assertEqual(self.git(self.destination, "rev-list", "--count", "HEAD").strip(), "1")
+
+	def test_destination_writer_needs_only_personal_identity_and_daily_counts(self):
+		destination = Destination(
+			self.destination, GitIdentity("Personal Developer", "personal@example.test")
+		)
+		plan = mirror.build_plan({"2024-01-02": 2, "2024-01-01": 1}, ())
+		snapshot = mirror_destination.inspect_destination(destination)
+		mirror_destination.prepare_destination(destination, snapshot)
+		mirror_destination.write_commits(destination, plan)
+		self.assertEqual(self.git(self.destination, "log", "--format=%aI").splitlines(), [
+			"2024-01-02T12:00:00+00:00", "2024-01-02T12:00:00+00:00",
+			"2024-01-01T12:00:00+00:00"
+		])
+		self.assertEqual(self.git(self.destination, "log", "--format=%ae:%ce").splitlines(), [
+			"personal@example.test:personal@example.test"
+		] * 3)
+		objects = self.git(
+			self.destination, "cat-file", "--batch-all-objects", "--batch-check=%(objecttype)"
+		).splitlines()
+		self.assertCountEqual(objects, ["commit", "commit", "commit", "tree"])
+		self.assertFalse((self.destination / ".git" / mirror.STATE_NAME).exists())
+
+	def test_interrupted_writer_keeps_checkpoint_and_resumes_only_missing_commits(self):
+		self.commit("2024-01-01T10:00:00+00:00")
+		self.commit("2024-01-02T10:00:00+00:00")
+		original_git = mirror_destination.git
+		writes = 0
+
+		def interrupted_git(path, arguments, **kwargs):
+			nonlocal writes
+			if "commit" in arguments:
+				writes += 1
+				if writes == 2:
+					raise mirror.MirrorError("Synthetic write interruption.")
+			return original_git(path, arguments, **kwargs)
+
+		with mock.patch.object(mirror_destination, "git", interrupted_git):
+			with self.assertRaisesRegex(mirror.MirrorError, "Synthetic write interruption"):
+				self.run_mirror(apply=True)
+		self.assertEqual(self.git(self.destination, "rev-list", "--count", "HEAD").strip(), "1")
+		state = json.loads((self.destination / ".git" / mirror.STATE_NAME).read_text())
+		self.assertEqual(len(state["commits"]), 2)
+		self.assertEqual(self.run_mirror(apply=True)["new_mirror_commits"], [
+			{"date": "2024-01-02", "count": 1}
+		])
+		self.assertEqual(self.git(self.destination, "rev-list", "--count", "HEAD").strip(), "2")
+		self.assertEqual(self.run_mirror(apply=True)["new_mirror_commits"], [])
+
 	def test_errors_never_silently_drop_sources_or_accept_foreign_destinations(self):
 		self.commit("2024-01-01T10:00:00+00:00")
 		self.config["companies"][0]["repositories"][0]["ref"] = "missing"
@@ -160,7 +246,7 @@ class MirrorTests(unittest.TestCase):
 		raw["destination"]["path"] = str(self.destination)
 		config_path.write_text(json.dumps(raw))
 		loaded = mirror.load_config(config_path)
-		self.assertEqual(loaded["destination"]["path"], self.destination)
+		self.assertEqual(loaded.destination.path, self.destination)
 		raw["token"] = "must-not-be-needed"
 		config_path.write_text(json.dumps(raw))
 		with self.assertRaisesRegex(mirror.MirrorError, "required keys"):
@@ -192,8 +278,9 @@ class MirrorTests(unittest.TestCase):
 
 	def run_mirror(self, **kwargs):
 		output = io.StringIO()
+		config = parse_config(json.loads(json.dumps(self.config, default=str)), self.root)
 		with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
-			mirror.run(self.config, **kwargs)
+			mirror.run(config, **kwargs)
 		return json.loads(output.getvalue())
 
 	def commit(self, date, email="work@example.test", repository=None):

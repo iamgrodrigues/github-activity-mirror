@@ -3,9 +3,39 @@
 A local, preview-first tool for reflecting **daily Git commit activity** in a
 separate personal repository. It creates empty commits, not copies of work code.
 
+The goal is to reflect permitted development activity on a personal profile
+without changing the original account's identity or touching its repositories.
+Everything runs locally; you decide what to preview, import, and publish.
+
 **Establish permission to export activity dates and counts before using real
 work sources.** Local access, a private destination, and writing the tool yourself
 do not establish that permission.
+
+## Two repositories, different purposes
+
+- **The tool repository** contains reusable Python code, documentation, a generic
+  configuration example, and tests using synthetic data. It does not need your
+  actual configuration or activity history.
+- **Your data repository** contains only generated empty commits. Their dates
+  let GitHub display permitted activity on your personal contribution graph.
+  Keep this repository private; it does not need to be public for private
+  contributions to appear on your profile.
+
+A public tool does not require public data. Keep configurations and the local
+ledger out of both repositories' tracked files.
+
+## Get started
+
+1. Copy or clone the tool into a personal development folder.
+2. Install Python and Git if needed; no Python dependencies are required.
+3. Copy the example configuration and replace every placeholder with your own
+   approved local sources and personal destination identity.
+4. Preview a small date range first and review its dates and counts.
+5. Apply locally only after permission and the preview are confirmed.
+6. Publish only the dedicated data repository, separately and intentionally.
+
+The sections below explain each step. No scheduler is installed: repeat the
+preview/apply process when you want to update the mirror.
 
 ## What this does
 
@@ -94,6 +124,9 @@ python3 mirror.py --config config.json --apply --allow-metadata-export
 This writes **only to the local destination**. It does not publish anything.
 Rerunning creates only missing commits. An interrupted commit loop can be resumed
 using the same ledger. A lock blocks simultaneous writes to that destination.
+After acquiring the lock, apply rechecks both daily counts and the destination's
+exact HEAD. If history changed during collection, even without changing its
+counts, the run stops before saving the ledger or generating commits.
 After a crash, inspect running processes before manually removing a stale
 `.git/activity-mirror.lock`.
 
@@ -106,6 +139,12 @@ history rewriting.
 
 Create a **separate private personal GitHub repository**, empty with no initial
 README, license, or gitignore. Do not fork or copy company repositories.
+Do not use your personal profile README repository as the destination.
+
+Do not add a README to the data repository later, either. The writer deliberately
+accepts only file-free, recognizable synthetic history; a README would stop
+future imports. Explain the approach in the tool's documentation or your profile
+instead of weakening that safety boundary.
 
 Verify the authenticated account is your personal account and verify the exact
 remote owner/repository before publishing. From the configured destination,
@@ -119,9 +158,31 @@ Both original author time and timezone are replaced by noon UTC.
 
 To display a private destination's activity on your public graph, enable GitHub's
 private-contribution visibility setting. Activity must satisfy GitHub's
-[contribution criteria](https://docs.github.com/en/account-and-profile/reference/profile-contributions-reference).
+contribution criteria, including an associated author email and an eligible
+default branch.
 Graph processing may take time. Publishing dates/counts reveals work cadence,
 even when the destination repository is private.
+
+## What is and is not published
+
+| Information | Where it belongs |
+| --- | --- |
+| Approved source paths, refs, and author email filters | Ignored local configuration only |
+| Original commit hashes and calendar dates | Local ledger inside the destination's `.git` directory |
+| Source code, filenames, commit messages, issue details, and repository URLs | Not copied into the generated history |
+| Daily activity counts and calendar dates | Represented by synthetic commits in the data repository |
+| Personal author/committer identity and a generic message | Present in every generated commit |
+
+This is data minimization, not anonymity. Dates and counts can reveal work
+patterns or support inferences when combined with other public information.
+Making the data repository public would expose its detailed synthetic history
+to everyone, without improving the tool's functionality.
+
+Before sharing the tool or any derivative, inspect **all Git history and refs**,
+not just the latest files. Keep employer-specific names, links, email addresses,
+credentials, local paths, and real configurations out of published material.
+An ignore rule prevents accidental staging; it does not remove a file that was
+already committed.
 
 ## Local-only data and recovery
 
@@ -143,11 +204,41 @@ are explicit and return a nonzero exit status.
 
 ## Development
 
+The implementation uses a small package, with no framework or dependencies:
+
+- [`mirror.py`](mirror.py): CLI validation and orchestration. Builds one immutable
+  dates/counts plan used by both preview output and apply.
+- [`activity_mirror/models.py`](activity_mirror/models.py): frozen dataclasses
+  describing configuration, source activity, and the aggregate plan.
+- [`activity_mirror/config.py`](activity_mirror/config.py): validates local JSON
+  configuration and resolves paths; company labels stay at this boundary.
+- [`activity_mirror/collector.py`](activity_mirror/collector.py): reads approved
+  source refs and authors, returning deduplicated commit hashes and dates.
+- [`activity_mirror/ledger.py`](activity_mirror/ledger.py): keeps source hashes
+  local, merges activity, and handles atomic checkpoints and the destination lock.
+- [`activity_mirror/destination.py`](activity_mirror/destination.py): inspects the
+  destination and generates empty commits. Its writer receives only the personal
+  destination identity/path and the dates/counts plan, never source metadata.
+- [`activity_mirror/git.py`](activity_mirror/git.py): shared subprocess boundary,
+  isolated Git environment, and sanitized Git errors.
+
+Flow: load configuration, inspect the destination, collect and merge activity,
+build and print the plan, then optionally lock, recheck, checkpoint, and write.
+Checkpointing before the write loop preserves interrupted-run recovery.
+CLI flags, configuration JSON, preview JSON, and the ledger format are unchanged.
+Internal Python helpers now use typed dataclasses instead of nested dictionaries.
+
 ```bash
 python3 -m unittest -v
 ```
 
 Tests create temporary synthetic repositories only. They exercise historical
 imports, personal-only output, date filtering, read-only previews, duplicate
-sources, future-company changes, interrupted imports, and explicit failures.
+sources, future-company changes, interrupted imports, concurrent history
+rewrites, and explicit failures.
 They do not access work repositories, GitHub, or real credentials.
+
+## License
+
+MIT. See [LICENSE](LICENSE). The license covers this tool, not any source data
+you may have permission to process.
