@@ -15,6 +15,40 @@ Everything runs locally; you decide what to preview, import, and publish.
 work sources.** Local access, a private destination, and writing the tool yourself
 do not establish that permission.
 
+## Guided setup options
+
+The [quick start](../README.md#quick-start) is the recommended beginner path.
+Keep an existing installation rather than downloading another copy.
+After installing Python or Git, restart your terminal/editor if commands are
+not found. VS Code is optional; a normal terminal in the tool folder also works.
+
+For `--setup`, have your source folders, source author emails, and personal
+GitHub noreply email ready. Sources must contain local Git history; they can
+have originated on GitHub, GitLab, or Bitbucket. Source-file-only ZIPs do not
+contain that history. Setup never clones, fetches, changes sources, or switches
+accounts.
+
+Press Enter to accept a displayed default. The start date defaults to the
+current year; enter an earlier date or `all` to include older approved history.
+The end can be a date or `ongoing`. These choices are saved for later runs.
+
+Cancel before saving with Ctrl+C. Setup never overwrites an existing
+configuration. To create a separate profile, use
+`python3 mirror.py --setup --config config.new.json` (on Windows, use `python`).
+Add `--config config.new.json` to later preview/apply commands for that profile.
+Settings must stay outside every source and the personal mirror folder.
+
+For the default saved settings, `python3 mirror.py` previews without writing;
+`--apply --allow-metadata-export` imports locally without pushing.
+Older manual configurations without saved history limits keep their unbounded
+date behavior; use the [history options](#choose-how-far-back-to-import) explicitly.
+Changing history limits does not remove previously imported activity.
+
+For the standard empty-tree hash explanation, see
+[Why the empty-tree hash is safe](#why-the-empty-tree-hash-is-safe).
+For automatic updates, status/removal commands, or changing the daily time, see
+[daily scheduling](scheduling.md).
+
 ## Two repositories, different purposes
 
 - **The tool repository** contains reusable Python code, documentation, a generic
