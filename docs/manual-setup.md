@@ -613,9 +613,41 @@ ledger before resuming; the tool refuses to guess if existing mirror history
 has no ledger.
 
 Original hashes are read locally, but never inserted into generated commits.
-Source commands request only commit hash, author email, and author date.
+History scans request only commit hash, author email, and author date.
 Diagnostics suppress Git output that might expose source metadata. Run failures
 are explicit and return a nonzero exit status.
+
+### Faster repeat imports
+
+Successful imports also save a private scan cache at
+`<destination>/.git/activity-mirror-scan.json`. No extra setup is needed.
+Manual imports and scheduled runs use the same optimization:
+
+- If a configured source tip and its import settings have not changed, no
+  source history scan runs.
+- If the branch advances, Git scans only history not reachable from the previous
+  checkpoint. Newly merged or backdated commits are included; this is not a
+  "newer than the last date" filter.
+- New sources, changed author/date filters, or changed shallow/replacement history
+  require a full scan for that scope. Rewritten branches contribute newly
+  reachable hashes without removing previously imported activity.
+- A missing cache or unavailable checkpoint is rebuilt by scanning. Existing
+  installations need one initial scan after upgrading.
+
+Previews can read checkpoints but never save them. Imports save checkpoints only
+after all planned mirror commits are written. A fingerprint binds the cache to
+the ledger; if the ledger changes after an interruption or restoration, a full
+scan safely rebuilds checkpoints.
+
+The cache holds source tip hashes and hashed scope fingerprints, not source code
+or credentials. It stays local and is never pushed; protect it like the ledger.
+A missing cache only costs a rescan. A malformed cache causes an explicit error:
+after diagnosis, remove only `activity-mirror-scan.json` to rebuild it.
+**Never delete the ledger to reset scanning.**
+
+This avoids repeatedly enumerating old source commits. Ledger processing and
+the mirror's full integrity checks still run, so overall runtime is not constant
+as the mirror grows.
 
 ### Why the empty-tree hash is safe
 
@@ -665,9 +697,11 @@ The implementation uses a small package, with no framework or dependencies:
 - [`activity_mirror/setup.py`](../activity_mirror/setup.py): local interactive
   configuration, saved history limits, and exclusive creation of private settings.
 - [`activity_mirror/collector.py`](../activity_mirror/collector.py): reads approved
-  source refs and authors, returning deduplicated commit hashes and dates.
+  source refs and authors, returning deduplicated commit hashes/dates and
+  scope-specific checkpoints for incremental scans.
 - [`activity_mirror/ledger.py`](../activity_mirror/ledger.py): keeps source hashes
-  local, merges activity, and handles atomic checkpoints and the destination lock.
+  local, merges activity, and handles the private scan cache, atomic checkpoints,
+  and the destination lock.
 - [`activity_mirror/destination.py`](../activity_mirror/destination.py): inspects the
   destination and generates empty commits. Its writer receives only the personal
   destination identity/path and the dates/counts plan, never source metadata.
@@ -680,9 +714,10 @@ The implementation uses a small package, with no framework or dependencies:
 - [`activity_mirror/publishing.py`](../activity_mirror/publishing.py): private
   personal target verification and explicit, non-force synthetic-tip publication.
 
-Flow: load configuration, inspect the destination, collect and merge activity,
-build and print the plan, then optionally lock, recheck, checkpoint, and write.
-Checkpointing before the write loop preserves interrupted-run recovery.
+Flow: load configuration, inspect the destination and private checkpoints,
+collect and merge activity, build and print the plan, then optionally lock,
+recheck, checkpoint the ledger, and write. Saving the ledger before the write
+loop preserves interrupted-run recovery; scan checkpoints advance only afterward.
 Existing non-setup CLI flags, preview JSON, and the ledger format are unchanged.
 Configuration accepts an optional `history` object; legacy configurations without
 it retain their original unbounded defaults. Python helpers use typed dataclasses.

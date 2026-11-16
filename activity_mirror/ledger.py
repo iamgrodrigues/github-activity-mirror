@@ -1,7 +1,9 @@
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import sys
 import tempfile
 from types import TracebackType
 from typing import Mapping
@@ -10,6 +12,7 @@ from .models import MirrorError, SourceCommit, require_keys, valid_date
 
 
 STATE_NAME = "activity-mirror-state.json"
+SCAN_NAME = "activity-mirror-scan.json"
 
 
 def load_state(path: Path) -> dict[str, str]:
@@ -31,6 +34,35 @@ def load_state(path: Path) -> dict[str, str]:
 	return result
 
 
+def load_checkpoints(path: Path, commits: Mapping[str, str]) -> dict[str, str]:
+	if not path.exists():
+		return {}
+	try:
+		raw: object = json.loads(path.read_text())
+	except json.JSONDecodeError:
+		raise MirrorError("Local scan cache is invalid JSON; remove only the scan cache to rebuild it, not the ledger.") from None
+	state = require_keys(raw, {"version", "ledger_sha256", "checkpoints"}, "local scan cache")
+	checkpoints = state["checkpoints"]
+	digest = state["ledger_sha256"]
+	if (
+		state["version"] != 1 or not isinstance(digest, str)
+		or not re.fullmatch(r"[0-9a-f]{64}", digest) or not isinstance(checkpoints, dict)
+	):
+		raise MirrorError("Unsupported local scan cache format; remove only the scan cache to rebuild it, not the ledger.")
+	result: dict[str, str] = {}
+	for key, commit in checkpoints.items():
+		if (
+			not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key)
+			or not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit)
+		):
+			raise MirrorError("Local scan cache contains an invalid entry; remove only the scan cache to rebuild it, not the ledger.")
+		result[key] = commit
+	if digest != ledger_digest(commits):
+		print("Scan checkpoints do not match the local ledger; performing a full source scan.", file=sys.stderr)
+		return {}
+	return result
+
+
 def merge_activity(
 	seen: Mapping[str, str],
 	collected: tuple[SourceCommit, ...]
@@ -44,10 +76,24 @@ def merge_activity(
 
 
 def save_state(path: Path, commits: Mapping[str, str]) -> None:
+	save_json(path, {"version": 1, "commits": dict(commits)})
+
+
+def save_checkpoints(path: Path, commits: Mapping[str, str], checkpoints: Mapping[str, str]) -> None:
+	save_json(path, {
+		"version": 1, "ledger_sha256": ledger_digest(commits), "checkpoints": dict(checkpoints)
+	})
+
+
+def ledger_digest(commits: Mapping[str, str]) -> str:
+	return hashlib.sha256(json.dumps(dict(commits), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def save_json(path: Path, value: object) -> None:
 	fd, temporary = tempfile.mkstemp(prefix=".activity-mirror-", dir=path.parent)
 	try:
 		with os.fdopen(fd, "w") as stream:
-			json.dump({"version": 1, "commits": dict(commits)}, stream, sort_keys=True)
+			json.dump(value, stream, sort_keys=True)
 			stream.flush()
 			os.fsync(stream.fileno())
 		os.replace(temporary, path)

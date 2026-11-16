@@ -108,6 +108,9 @@ Each run:
 
 Normal approved source fetches remain your responsibility. If you have not
 refreshed a configured upstream ref, a daily run cannot see newer remote commits.
+After the first successful import, [incremental scanning](manual-setup.md#faster-repeat-imports)
+skips unchanged source history and reads only newly reachable commits for
+changed branches. Scope changes or missing checkpoints can require a full scan.
 
 ## Privacy and failures
 

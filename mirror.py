@@ -13,7 +13,7 @@ from typing import Mapping
 from activity_mirror.collector import collect
 from activity_mirror.config import load_config
 from activity_mirror.destination import inspect_destination, prepare_destination, write_commits
-from activity_mirror.ledger import DestinationLock, STATE_NAME, load_state, merge_activity, save_state
+from activity_mirror.ledger import DestinationLock, SCAN_NAME, STATE_NAME, load_checkpoints, load_state, merge_activity, save_checkpoints, save_state
 from activity_mirror.models import Config, DailyCount, MirrorError, MirrorPlan
 from activity_mirror.schedule import manage_schedule, run_scheduled
 from activity_mirror.setup import configure
@@ -85,8 +85,11 @@ def run(
 	seen = load_state(state_path) if snapshot.exists else {}
 	if snapshot.daily_counts and not seen:
 		raise MirrorError("Local ledger is missing. Restore its private backup before continuing.")
-	seen = merge_activity(seen, collect(config.sources, since, until))
-	plan = build_plan(collections.Counter(seen.values()), snapshot.daily_counts)
+	scan_path = snapshot.git_dir / SCAN_NAME
+	checkpoints = load_checkpoints(scan_path, seen) if snapshot.exists else {}
+	activity = collect(config.sources, since, until, checkpoints)
+	merged = merge_activity(seen, activity.commits)
+	plan = build_plan(collections.Counter(merged.values()), snapshot.daily_counts)
 	print(json.dumps(asdict(plan), indent="\t"))
 	if not apply:
 		print("Preview only. No files or repositories changed.", file=sys.stderr)
@@ -96,8 +99,11 @@ def run(
 		current = inspect_destination(destination)
 		if current.daily_counts != snapshot.daily_counts or current.head != snapshot.head:
 			raise MirrorError("Destination changed during collection. Run the preview again.")
-		save_state(state_path, seen)
+		if load_state(state_path) != seen:
+			raise MirrorError("Local ledger changed during collection. Run the preview again.")
+		save_state(state_path, merged)
 		write_commits(destination, plan)
+		save_checkpoints(scan_path, merged, activity.checkpoints)
 	created = sum(daily.count for daily in plan.new_mirror_commits)
 	print(f"Created {created} local mirror commits. Nothing was pushed.", file=sys.stderr)
 	return plan
