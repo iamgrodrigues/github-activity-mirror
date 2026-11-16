@@ -57,6 +57,21 @@ class MirrorPlan:
 	new_mirror_commits: tuple[DailyCount, ...]
 
 
+@dataclass(frozen=True)
+class Schedule:
+	config: Path
+	config_sha256: str
+	repository: str
+	history: HistoryWindow
+	time: str
+	python: Path
+	script: Path
+	path: str
+	start_date: datetime.date
+	export_approved: bool = True
+	publish_approved: bool = True
+
+
 def require_keys(value: object, keys: set[str], label: str) -> dict[str, object]:
 	if not isinstance(value, dict) or set(value) != keys:
 		raise MirrorError(f"Invalid {label}; required keys: {', '.join(sorted(keys))}.")
