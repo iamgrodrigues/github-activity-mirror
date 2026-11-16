@@ -60,7 +60,9 @@ a command. Keep quotation marks around paths, including paths without spaces.
 - Creates synthetic personal commits at noon UTC on those dates.
 - Retains a private local ledger so reruns and future-company configurations do
   not duplicate previously imported commits.
-- Never fetches, pushes, calls GitHub APIs, or changes source repositories.
+- Never fetches or changes source repositories. Manual imports do not push or
+  call GitHub APIs; [optional daily scheduling](scheduling.md) verifies your
+  personal destination and publishes only the synthetic mirror.
 
 It does **not** transfer official contribution credit, reproduce language
 statistics, collect PR approvals, or guarantee an identical work-account total.
@@ -513,8 +515,9 @@ though repository details stay private.
    remote checks in step 7, then push the destination again.
 
 Zero new commits is normal when nothing new matches. Date windows can overlap:
-the ledger deduplicates already-seen hashes. Nothing runs automatically; there is
-no scheduler, automatic fetch, or automatic push.
+the ledger deduplicates already-seen hashes. By default nothing runs automatically,
+and sources are never automatically fetched. [Optional daily scheduling](scheduling.md) can automate
+imports and personal publishing after separate recurring-export approval.
 
 For an additional source, copy a repository entry inside `repositories`, separated
 by a comma, and fill in its approved details. For a future company, add a company
@@ -636,6 +639,12 @@ The implementation uses a small package, with no framework or dependencies:
   destination identity/path and the dates/counts plan, never source metadata.
 - [`activity_mirror/git.py`](../activity_mirror/git.py): shared subprocess boundary,
   isolated Git environment, and sanitized Git errors.
+- [`activity_mirror/schedule.py`](../activity_mirror/schedule.py): explicit daily
+  approval, frozen configuration scope, private state, and scheduled orchestration.
+- [`activity_mirror/schedulers.py`](../activity_mirror/schedulers.py): per-user
+  native scheduler definitions, installation, status, and ownership-checked removal.
+- [`activity_mirror/publishing.py`](../activity_mirror/publishing.py): private
+  personal target verification and explicit, non-force synthetic-tip publication.
 
 Flow: load configuration, inspect the destination, collect and merge activity,
 build and print the plan, then optionally lock, recheck, checkpoint, and write.
